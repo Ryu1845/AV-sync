@@ -52,7 +52,7 @@ def process_data():
     vid2_cropped = os.path.join('data/out', data['vid2_base_name'], 'cropped.avi')
     if opt.modality == 'all':
         def get_audio_and_video_embeddings(vid, aud):
-            vid_emb = utils.vid2emb(vid, model, True)[1]
+            vid_emb = utils.vid2emb(vid, model, True)
             aud_emb = utils.aud2emb(aud, model, True)[1]
             min_len = min(len(vid_emb), len(aud_emb))
             return [vid_emb[:min_len], aud_emb[:min_len]]
@@ -62,11 +62,11 @@ def process_data():
 
     else:
         if opt.modality[0] == 'v':
-            data['emb1'] = utils.vid2emb(vid1_cropped, model, True)[1]
+            data['emb1'] = utils.vid2emb(vid1_cropped, model, True)
         else:
             data['emb1'] = utils.aud2emb(data['aud1'], model, True)[1]
         if opt.modality[1] == 'v':
-            data['emb2'] = utils.vid2emb(vid2_cropped, model, True)[1]
+            data['emb2'] = utils.vid2emb(vid2_cropped, model, True)
         else:
             data['emb2'] = utils.aud2emb(data['aud2'], model, True)[1]
 
@@ -184,11 +184,11 @@ def main():
     data['out_base_file'] = os.path.join(out_folder, 'modality_%s' % opt.modality)
     print('out will be saved to ', data['out_base_file'])
 
-    dp_mat, dp_orig = utils.dynamic_programming(data['emb1'], data['emb2'], prefer_delay=opt.prefer_delay)
-    path, cost = utils.find_path(dp_mat, dp_orig)
+    dp = utils.dynamic_programming(data['emb1'], data['emb2'], prefer_delay=opt.prefer_delay)
+    path, cost = utils.find_path(dp)
 
     if opt.save_dp_images:
-        save_dp_images(dp_mat, path, data)
+        save_dp_images(dp.dense(), path, data)
 
     # every audio frame should be associated with a single video frame
     path = path.tolist()

@@ -57,8 +57,8 @@ def iter_frames(video_path):
     size = w * h * 3
     command = ['ffmpeg', '-v', 'error', '-i', video_path, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
     with subprocess.Popen(command, stdout=subprocess.PIPE) as proc:
-        while len(buf := proc.stdout.read(size)) == size:
-            yield torch.frombuffer(bytearray(buf), dtype=torch.uint8).view(h, w, 3)
+        while proc.stdout.readinto(buf := bytearray(size)) == size:
+            yield torch.frombuffer(buf, dtype=torch.uint8).view(h, w, 3)
 
 def read_vid(video_path):
     assert probe_vid(video_path)[2] == FPS, 'when changing fps MAKE SURE no new frames are inserted'
@@ -155,19 +155,24 @@ def stabilizeSequence(samples, regularization_lambda=30.0):
     if length < 6:
         return samples
 
-    # find x that solves laplacian_matrix * x = b
-    laplacian_matrix = (
-        torch.diag(torch.full((length - 2,), 1.0 + 2 * regularization_lambda, dtype=torch.float64), 0)
-        + torch.diag(torch.full((length - 3,), -1.0 * regularization_lambda, dtype=torch.float64), 1)
-        + torch.diag(torch.full((length - 3,), -1.0 * regularization_lambda, dtype=torch.float64), -1))
+    # find x that solves laplacian_matrix * x = b, laplacian_matrix = tridiag(-lambda, 1 + 2 lambda, -lambda).
+    # It is strictly diagonally dominant, so the Thomas algorithm is stable and is what LU without pivoting does.
+    s = samples.tolist()
+    b = s[1:-1]
+    b[0] += regularization_lambda * s[0]
+    b[-1] += regularization_lambda * s[-1]
+    diag, off = 1.0 + 2 * regularization_lambda, -1.0 * regularization_lambda
 
-    constraints = torch.zeros(length - 2, dtype=torch.float64)
-    constraints[0] = (regularization_lambda * samples[0])
-    constraints[-1] = (regularization_lambda * samples[-1])
-    constraints += samples[1:-1]
+    cp, dp = [off / diag], [b[0] / diag]
+    for k in range(1, len(b)):
+        denom = diag - off * cp[-1]
+        cp.append(off / denom)
+        dp.append((b[k] - off * dp[-1]) / denom)
+    for k in range(len(b) - 2, -1, -1):
+        dp[k] -= cp[k] * dp[k + 1]
 
     x = samples.clone()
-    x[1:-1] = torch.linalg.solve(laplacian_matrix, constraints)
+    x[1:-1] = torch.tensor(dp, dtype=samples.dtype)
     return x
 
 def aud2tensor(aud):
@@ -180,34 +185,45 @@ def aud2emb(aud, model, every_frame=False):
     step = 1 if every_frame else 4
     if every_frame:
         lastframe *= 4
-    cc = aud2tensor(aud)
+    windows = aud2tensor(aud)[0, 0].unfold(1, 20, step)  # 13 x N x 20 view, window k starts at mfcc frame k*step
     dev = next(model.__S__.parameters()).device
     cc_feat = []
     with torch.inference_mode():
         for i in range(0, lastframe, batch_size):
-            cc_in = torch.cat([cc[..., vframe*step:vframe*step + 20] for vframe in range(i, min(lastframe, i+batch_size))])
+            cc_in = windows[:, i:min(lastframe, i+batch_size)].permute(1, 0, 2)[:, None].contiguous()
             cc_feat.append(model.__S__.forward_aud(cc_in.to(dev)).cpu())
     return aud, torch.cat(cc_feat)
 
+def _lip_batch(model, frames, dev):
+    # T x H x W x 3 uint8 frames -> embeddings of the T-4 windows of 5 consecutive frames
+    clip = torch.stack(frames).to(dev).permute(3, 0, 1, 2)  # 3 x T x H x W
+    im_in = clip.unfold(1, 5, 1).permute(1, 0, 4, 2, 3).float().contiguous()  # (T-4) x 3 x 5 x H x W
+    return model.__S__.forward_lip(im_in).cpu()
+
 def vid2emb(images, model, every_frame=False):
+    """images: video path or a sequence of 224 x 224 x 3 uint8 frames; frames are streamed, not stored."""
     if type(images) == str:
-        images = read_vid(images)
-    assert images.shape[1:] == (224, 224, 3)
-    lastframe = len(images) - 6
-    im = images.permute(3, 0, 1, 2)[None].float()  # 1 x 3 x T x H x W
+        assert probe_vid(images)[2] == FPS, 'when changing fps MAKE SURE no new frames are inserted'
+        images = iter_frames(images)
     dev = next(model.__S__.parameters()).device
-    im_feat = []
+    # windows start at frames 0 .. T-7, batch_size at a time; a full batch needs batch_size + 6 buffered frames
+    im_feat, buf = [], []
     with torch.inference_mode():
-        for i in range(0, lastframe, batch_size):
-            im_in = torch.cat([im[:, :, vframe:vframe+5] for vframe in range(i, min(lastframe, i+batch_size))])
-            im_feat.append(model.__S__.forward_lip(im_in.to(dev)).cpu())
+        for frame in images:
+            assert frame.shape == (224, 224, 3)
+            buf.append(frame)
+            if len(buf) == batch_size + 6:
+                im_feat.append(_lip_batch(model, buf[:batch_size + 4], dev))
+                buf = buf[batch_size:]
+        if len(buf) > 6:
+            im_feat.append(_lip_batch(model, buf[:-2], dev))
     im_feat = torch.cat(im_feat)
 
     if every_frame:
         frames = torch.arange(len(im_feat), dtype=torch.float64)
         im_feat = interp(torch.arange(len(im_feat) * 4, dtype=torch.float64) / 4, frames, im_feat)
 
-    return images, im_feat
+    return im_feat
 
 def run_command(command, verbose=True):
     print('runing: ', shlex.join(command) if verbose else '...' , end=' ')
@@ -235,67 +251,136 @@ def resize_vec(vec, new_length):
     coordinates = torch.linspace(0, vec.numel()-1, new_length, dtype=torch.float64)
     return interp(coordinates, torch.arange(vec.numel(), dtype=torch.float64), vec)
 
-def data_cost(emb1, emb2, prefer_delay=False):
-    # minimal mean squared distance over all pairs of feature streams
-    cost = torch.stack([
-        torch.cdist(f1.double(), f2.double(), compute_mode='donot_use_mm_for_euclid_dist') ** 2 / f1.shape[1]
-        for f1 in emb1 for f2 in emb2]).amin(0)
-    if prefer_delay:
-        cost = torch.minimum(cost, torch.cat([cost[:1], cost[:-1]]))
-    return cost
+def band_limits(n, m, max_warp=MAX_WARP):
+    # row i of the dp only visits columns [lo[i], hi[i]); both are non-decreasing in i
+    lo = [max(0, i*m//n - max_warp) for i in range(n)]
+    hi = [min(i*m//n + max_warp, m) for i in range(n)]
+    return lo, hi
+
+def data_cost(emb1, emb2, lo, hi, prefer_delay=False, block=64):
+    """Minimal mean squared distance over all pairs of feature streams, for the band columns only.
+
+    Row i holds cost[i, lo[i]:hi[i]] at [i, :hi[i]-lo[i]], the rest of the row is inf."""
+    n = len(lo)
+    width = max(h - l for l, h in zip(lo, hi))
+    lo_t, hi_t = torch.tensor(lo), torch.tensor(hi)
+    out = torch.full((n, width), math.inf, dtype=torch.float64)
+    for i0 in range(0, n, block):
+        i1 = min(i0 + block, n)
+        # with prefer_delay each row also needs the previous row on its own columns
+        r0 = max(0, i0 - 1) if prefer_delay else i0
+        c0, c1 = lo[i0], hi[i1 - 1]
+        cost = torch.stack([
+            torch.cdist(f1[r0:i1].double(), f2[c0:c1].double(), compute_mode='donot_use_mm_for_euclid_dist') ** 2
+            / f1.shape[1] for f1 in emb1 for f2 in emb2]).amin(0)
+        if prefer_delay:
+            prev = cost[:-1] if r0 < i0 else torch.cat([cost[:1], cost[:-1]])
+            cost = torch.minimum(cost[i0 - r0:], prev)
+        cols = (lo_t[i0:i1, None] - c0) + torch.arange(width)
+        valid = cols < (hi_t[i0:i1, None] - c0)
+        out[i0:i1] = torch.where(valid, cost.gather(1, cols.clamp(max=c1 - c0 - 1)), math.inf)
+    return out
+
+def is_init(i, j):
+    # cells the dp starts from (zero accumulated cost)
+    return (i == 0 and j < relax_end) or (j == 0 and i < relax_end)
+
+class BandedDP:
+    """Accumulated dp cost and back pointers, stored only around the band each row visits.
+
+    Row i keeps columns [start[i], end[i]) of the accumulated cost and one direction code per band cell
+    (0: left, 1: diagonal, 2: up). Every other cell holds its initial value (0 or inf)."""
+
+    def __init__(self, n, m, lo, hi, start, end, vals, dirs):
+        self.shape = (n, m)
+        self.lo, self.hi, self.start, self.end, self.vals, self.dirs = lo, hi, start, end, vals, dirs
+
+    def value(self, i, j):
+        if self.start[i] <= j < self.end[i]:
+            return self.vals[i, j - self.start[i]].item()
+        return 0.0 if is_init(i, j) else math.inf
+
+    def origin(self, i, j):
+        k = j - self.lo[i]
+        if not 0 <= k < self.hi[i] - self.lo[i]:
+            return 0, 0
+        d = self.dirs[i][k]
+        pi, pj = max(0, i-1), max(0, j-1)
+        return ((i, pj), (pi, pj), (pi, j))[d]
+
+    def dense(self):
+        n, m = self.shape
+        mat = torch.full((n, m), math.inf, dtype=torch.float64)
+        mat[0, :relax_end] = 0
+        mat[:relax_end, 0] = 0
+        for i, (s, e) in enumerate(zip(self.start, self.end)):
+            mat[i, s:e] = self.vals[i, :e - s]
+        return mat
 
 def dynamic_programming(emb1, emb2, max_warp=MAX_WARP, prefer_delay=False):
     if not type(emb1) == list:
         emb1 = [emb1]
         emb2 = [emb2]
     n, m = emb1[0].shape[0], emb2[0].shape[0]
-    cost = data_cost(emb1, emb2, prefer_delay).tolist()
+    lo, hi = band_limits(n, m, max_warp)
+    cost = data_cost(emb1, emb2, lo, hi, prefer_delay)
     smooth_cost = 1 / smooth_div
 
+    # row i is read by rows i and i+1 at columns [lo[i]-1, hi[i+1]); keep exactly those
+    start = [max(0, l - 1) for l in lo]
+    end = hi[1:] + hi[-1:]
+    vals = torch.full((n, max(e - s for s, e in zip(start, end))), math.inf, dtype=torch.float64)
+    dirs = []
+
     # plain python floats: fast enough for the banded loop and keeps np.argmin's tie breaking
-    mat = [[math.inf] * m for _ in range(n)]
-    mat[0][:relax_end] = [0.0] * min(relax_end, m)
-    for i in range(min(relax_end, n)):
-        mat[i][0] = 0.0
-
-    orig = [[(0, 0)] * m for _ in range(n)]
-
+    prev_row = None
     for i in range(n):
+        s, e = start[i], end[i]
+        row = [math.inf] * (e - s)
+        if i < relax_end and s == 0:
+            row[0] = 0.0
+        if i == 0:
+            row[:relax_end] = [0.0] * min(relax_end, e)
+            prev_row = row
         pi = max(0, i-1)
-        diag_i = i*m//n
-        row, prev_row, cost_row = mat[i], mat[pi], cost[i]
-        for j in range(max(0, diag_i-max_warp), min(diag_i+max_warp, m)):
-            pj = max(0, j-1)
-            c = cost_row[j]
-            left, diag, up = c + smooth_cost + row[pj], c + prev_row[pj], c + smooth_cost + prev_row[j]
+        ps = start[pi]
+        l, h = lo[i], hi[i]
+        cost_row = cost[i, :h - l].tolist()
+        d_row = bytearray(h - l)
+        for j in range(l, h):
+            pj = j - 1 if j else 0
+            c = cost_row[j - l]
+            left, diag, up = c + smooth_cost + row[pj - s], c + prev_row[pj - ps], c + smooth_cost + prev_row[j - ps]
             if left <= diag and left <= up:
-                row[j], orig[i][j] = left, (i, pj)
+                row[j - s] = left
             elif diag <= up:
-                row[j], orig[i][j] = diag, (pi, pj)
+                row[j - s], d_row[j - l] = diag, 1
             else:
-                row[j], orig[i][j] = up, (pi, j)
-    return torch.tensor(mat, dtype=torch.float64), orig
+                row[j - s], d_row[j - l] = up, 2
+        vals[i, :e - s] = torch.tensor(row, dtype=torch.float64)
+        dirs.append(d_row)
+        prev_row = row
+    return BandedDP(n, m, lo, hi, start, end, vals, dirs)
 
 def done(i,j):
-    if i == 0 and j < relax_end:
-        return True
-    if j == 0 and i < relax_end:
-        return True
-    return False
+    return is_init(i, j)
 
-def find_path(dp_mat, dp_orig):
-    n, m = dp_mat.shape
-    amin1 = dp_mat[-1, -relax_end:].argmin().item() + m-relax_end
-    amin2 = dp_mat[-relax_end:, -1].argmin().item() + n-relax_end
+def find_path(dp):
+    n, m = dp.shape
+    last_cols = range(m)[-relax_end:]
+    last_rows = range(n)[-relax_end:]
+    amin1 = torch.tensor([dp.value(n-1, j) for j in last_cols], dtype=torch.float64).argmin().item() + m-relax_end
+    amin2 = torch.tensor([dp.value(i, m-1) for i in last_rows], dtype=torch.float64).argmin().item() + n-relax_end
+    amin1, amin2 = range(m)[amin1], range(n)[amin2]
     path = []
-    if dp_mat[-1, amin1] < dp_mat[amin2, -1]:
+    if dp.value(n-1, amin1) < dp.value(amin2, m-1):
         i,j = n-1, amin1
     else:
         i,j = amin2, m-1
-    cost = dp_mat[i,j].item()
+    cost = dp.value(i, j)
     while not done(i,j):
         path.append([i,j])
-        i,j = dp_orig[i][j]
+        i,j = dp.origin(i, j)
     path.append([i,j])
     path = path[::-1]
     return torch.tensor(path), cost
