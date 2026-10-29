@@ -44,6 +44,15 @@ data/out/video1_video2/modality_all.avi
 data/out/video1_video2/mix.avi
 ```
 
+### Speed and memory
+
+Memory of `align_audio.py` grows linearly with the input length: the dynamic programming only stores the band of
+`MAX_WARP` embeddings around the diagonal, and videos are streamed from ffmpeg instead of loaded whole.
+
+`align_audio.py` runs SyncNet in bfloat16 by default, which only pays off on hardware with bfloat16 support (recent
+GPUs, CPUs with AMX or AVX512-BF16). It changes the embeddings by 1-2%; the warp is unchanged on the demo and moves by
+at most 8 ms on a 60 s input. `--no-amp` runs it in float32.
+
 ## Publications
 
 ```

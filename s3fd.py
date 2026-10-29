@@ -140,22 +140,31 @@ class S3FD:
         self.net = S3FDNet().to(device).eval()
         self.net.load_state_dict(torch.load(path, map_location=device, weights_only=True))
 
-    @torch.inference_mode()
     def detect(self, image, conf_th=0.9, scale=0.25):
         """image: H x W x 3 uint8 RGB. Returns N x 5 rows of (y1, x1, y2, x2, score), coordinates relative to the image."""
-        x = image.permute(2, 0, 1)[None].float()
+        return self.detect_batch([image], conf_th, scale)[0]
+
+    @torch.inference_mode()
+    def detect_batch(self, images, conf_th=0.9, scale=0.25):
+        """images: equally sized H x W x 3 uint8 RGB frames, run through the network together. Returns a list of detect()."""
+        # move uint8 to the device and convert there: 4x less host to device traffic
+        x = torch.stack(images).to(self.device).permute(0, 3, 1, 2).float()
         if scale != 1:
             x = F.interpolate(x, scale_factor=scale, mode='bilinear')
-        x = x - torch.tensor(IMG_MEAN).view(1, 3, 1, 1)
-        loc, conf, priors = self.net(x.to(self.device))
+        # contiguous NCHW for the network, as with a single permuted frame (channels last selects other conv kernels)
+        x = x.contiguous() - torch.tensor(IMG_MEAN, device=self.device).view(1, 3, 1, 1)
+        loc, conf, priors = self.net(x)
 
-        scores = conf[0, :, 1]
-        mask = scores > conf_th
-        boxes, scores = decode(loc[0][mask], priors[mask]), scores[mask]
+        dets = []
+        for loc_i, conf_i in zip(loc, conf):
+            scores = conf_i[:, 1]
+            mask = scores > conf_th
+            boxes, scores = decode(loc_i[mask], priors[mask]), scores[mask]
 
-        keep = nms(boxes, scores, 0.3)
-        boxes, scores = boxes[keep], scores[keep]
-        keep = nms(boxes, scores, 0.1)
-        boxes, scores = boxes[keep], scores[keep]
+            keep = nms(boxes, scores, 0.3)
+            boxes, scores = boxes[keep], scores[keep]
+            keep = nms(boxes, scores, 0.1)
+            boxes, scores = boxes[keep], scores[keep]
 
-        return torch.cat([boxes[:, [1, 0, 3, 2]], scores[:, None]], 1).cpu()
+            dets.append(torch.cat([boxes[:, [1, 0, 3, 2]], scores[:, None]], 1).cpu())
+        return dets

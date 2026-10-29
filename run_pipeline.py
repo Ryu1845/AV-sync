@@ -89,6 +89,13 @@ def track_shot(opt, scenefaces):
 # # VIDEO CROP AND SAVE
 # ========== ========== ========== ==========
 
+def pad_span(start, stop, size, pad):
+  # slice [start, stop) of an axis of length size zero padded by pad on both sides, in padded coordinates.
+  # Returns (zeros before, frame start, frame stop, zeros after).
+  start, stop = (min(max(c, 0), size + 2*pad) - pad for c in (start, stop))
+  lo, hi = min(max(start, 0), size), min(max(stop, 0), size)
+  return max(0, min(stop, 0) - start), lo, max(lo, hi), max(0, stop - max(start, size))
+
 def crop_video(opt,track):
 
   video_file = os.path.join(opt.out_dir, 'video.avi')
@@ -117,11 +124,13 @@ def crop_video(opt,track):
       bs  = det[0]            # Detection box size
       bsi = int(bs*(1+2*cs))  # Pad videos by this amount
 
-      frame = F.pad(frame.permute(2,0,1), (bsi,bsi,bsi,bsi))
       my  = det[2]+bsi  # BBox center Y
       mx  = det[1]+bsi  # BBox center X
 
-      face = frame[:,int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
+      # same crop as slicing the frame zero padded by bsi on each side, but only the crop itself is padded
+      ya, ystart, ystop, yb = pad_span(int(my-bs), int(my+bs*(1+2*cs)), fh, bsi)
+      xa, xstart, xstop, xb = pad_span(int(mx-bs*(1+cs)), int(mx+bs*(1+cs)), fw, bsi)
+      face = F.pad(frame[ystart:ystop, xstart:xstop].permute(2,0,1), (xa, xb, ya, yb))
 
       resized = F.interpolate(face[None].float(), size=(224,224), mode='bilinear', antialias=True)[0]
       yield resized.round().clamp(0,255).to(torch.uint8).permute(1,2,0)
@@ -147,6 +156,9 @@ def crop_video(opt,track):
 # # FACE DETECTION
 # ========== ========== ========== ==========
 
+# batching gives no speedup on CPU, and batch 1 keeps the detections bit-identical there
+det_batch_size = 16 if utils.device.type == 'cuda' else 1
+
 def inference_video(opt):
 
   detector = S3FD(os.path.join(utils.data_dir, 'sfd_face.pth'), utils.device)
@@ -155,18 +167,26 @@ def inference_video(opt):
   print(utils.probe_vid(video_file))
 
   dets = []
+  batch = []
 
-  for frame_num, image_np in enumerate(utils.iter_frames(video_file)):
-
+  def detect_batch():
     # Actual detection.
     start_time = time.time()
-    boxes = detector.detect(image_np, conf_th=opt.min_conf, scale=opt.facedet_scale)
+    boxes = detector.detect_batch([image for _, image in batch], conf_th=opt.min_conf, scale=opt.facedet_scale)
     elapsed_time = time.time() - start_time
 
-    dets.append([[frame_num, box[:4], box[4]] for box in boxes.tolist()])
+    for (frame_num, _), frame_boxes in zip(batch, boxes):
+      dets.append([[frame_num, box[:4], box[4]] for box in frame_boxes.tolist()])
+      print('%s-%05d; %d dets; %.2f Hz' %
+            (video_file, frame_num, len(dets[-1]), (len(batch)/elapsed_time)))
+    batch.clear()
 
-    print('%s-%05d; %d dets; %.2f Hz' %
-          (video_file, frame_num, len(dets[-1]), (1/elapsed_time)))
+  for frame_num, image in enumerate(utils.iter_frames(video_file)):
+    batch.append((frame_num, image))
+    if len(batch) == det_batch_size:
+      detect_batch()
+  if batch:
+    detect_batch()
 
   return dets
 

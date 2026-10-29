@@ -13,11 +13,15 @@ WINDOWS_PER_SECOND = SR/(WINDOW_SIZE-OVERLAP)
 WINDOWS_PER_FRAME = WINDOWS_PER_SECOND/FPS
 
 batch_size = 32
+amp = False  # run SyncNet in bfloat16 (align_audio.py --amp)
 smooth_div = 20
 relax_end = 10
 MAX_WARP = 200
 
 data_dir = 'data/'
+
+def autocast():
+    return torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp)
 
 def tensor_bytes(t):
     t = t.contiguous().cpu()
@@ -191,14 +195,16 @@ def aud2emb(aud, model, every_frame=False):
     with torch.inference_mode():
         for i in range(0, lastframe, batch_size):
             cc_in = windows[:, i:min(lastframe, i+batch_size)].permute(1, 0, 2)[:, None].contiguous()
-            cc_feat.append(model.__S__.forward_aud(cc_in.to(dev)).cpu())
+            with autocast():
+                cc_feat.append(model.__S__.forward_aud(cc_in.to(dev)).float().cpu())
     return aud, torch.cat(cc_feat)
 
 def _lip_batch(model, frames, dev):
     # T x H x W x 3 uint8 frames -> embeddings of the T-4 windows of 5 consecutive frames
     clip = torch.stack(frames).to(dev).permute(3, 0, 1, 2)  # 3 x T x H x W
     im_in = clip.unfold(1, 5, 1).permute(1, 0, 4, 2, 3).float().contiguous()  # (T-4) x 3 x 5 x H x W
-    return model.__S__.forward_lip(im_in).cpu()
+    with autocast():
+        return model.__S__.forward_lip(im_in).float().cpu()
 
 def vid2emb(images, model, every_frame=False):
     """images: video path or a sequence of 224 x 224 x 3 uint8 frames; frames are streamed, not stored."""
