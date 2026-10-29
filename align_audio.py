@@ -16,8 +16,8 @@ parser.add_argument('--prefer_delay', action='store_true', default=False)
 parser.add_argument('--save_dp_images', action='store_true', default=False,
                     help='whether to store images showing the dynamic programing weights (requires matplotlib)')
 
-parser.add_argument('--amp', action='store_true', default=False,
-                    help='run SyncNet in bfloat16 (needs bfloat16 hardware support to be faster)')
+parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True,
+                    help='run SyncNet in bfloat16 (needs bfloat16 hardware support to be faster); --no-amp for float32')
 
 parser.add_argument('vid1', type=str)
 parser.add_argument('vid2', type=str)
