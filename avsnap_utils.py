@@ -1,18 +1,14 @@
-import numpy as np
-from scipy.io import wavfile
-from scipy import signal
-from scipy.ndimage.interpolation import map_coordinates
-import imageio, subprocess, os
+import ctypes, math, shlex, subprocess, sys, wave
 import torch
-import python_speech_features
-import sys
+import torch.nn.functional as F
 
-cuda = torch.cuda.is_available()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 SR = 16000
 FPS = 25
 WINDOW_SIZE = 512
 OVERLAP = 256
+HOP = WINDOW_SIZE - OVERLAP
 WINDOWS_PER_SECOND = SR/(WINDOW_SIZE-OVERLAP)
 WINDOWS_PER_FRAME = WINDOWS_PER_SECOND/FPS
 
@@ -21,194 +17,264 @@ smooth_div = 20
 relax_end = 10
 MAX_WARP = 200
 
-FNULL = open(os.devnull, 'w')
-
 data_dir = 'data/'
+
+def tensor_bytes(t):
+    t = t.contiguous().cpu()
+    return ctypes.string_at(t.data_ptr(), t.numel() * t.element_size())
+
 def read_aud(audio_path, verbose=True):
     if not audio_path.endswith('.wav'):
         video_path = audio_path
         audio_path = video_path[:-4] + '.wav'
-        command = ("ffmpeg -y -i %s -ac 1 -vn -acodec pcm_s16le -ar 16000 %s" % 
-            (video_path, audio_path)) 
-        run_command(command, verbose)    
-    
-    sr, y = wavfile.read(audio_path)
-    assert sr == SR
-    return y
+        command = ['ffmpeg', '-y', '-i', video_path, '-ac', '1', '-vn', '-acodec', 'pcm_s16le', '-ar', str(SR), audio_path]
+        run_command(command, verbose)
+
+    with wave.open(audio_path, 'rb') as f:
+        assert f.getframerate() == SR and f.getnchannels() == 1 and f.getsampwidth() == 2
+        y = torch.frombuffer(bytearray(f.readframes(f.getnframes())), dtype=torch.int16)
+    # keep the int16 scale: the MFCC features SyncNet was trained on depend on it
+    return y.double()
+
+def write_aud(audio_path, aud):
+    aud = (aud / aud.abs().max() * 32767).round().to(torch.int16)
+    with wave.open(audio_path, 'wb') as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(SR)
+        f.writeframes(tensor_bytes(aud))
+
+def probe_vid(video_path):
+    out = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,r_frame_rate',
+         '-of', 'default=noprint_wrappers=1', video_path], capture_output=True, text=True, check=True).stdout
+    meta = dict(line.split('=', 1) for line in out.split())
+    num, den = meta['r_frame_rate'].split('/')
+    return int(meta['width']), int(meta['height']), int(num) / int(den)
+
+def iter_frames(video_path):
+    w, h, _ = probe_vid(video_path)
+    size = w * h * 3
+    command = ['ffmpeg', '-v', 'error', '-i', video_path, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']
+    with subprocess.Popen(command, stdout=subprocess.PIPE) as proc:
+        while len(buf := proc.stdout.read(size)) == size:
+            yield torch.frombuffer(bytearray(buf), dtype=torch.uint8).view(h, w, 3)
 
 def read_vid(video_path):
-
-    reader = imageio.get_reader(video_path)
-    assert reader.get_meta_data()['fps'] == FPS, 'when changing fps MAKE SURE no new frames are inserted'
-
-    images = []
-    try:
-        for f in reader:
-            images.append(f) 
-    except:
-        pass
-
+    assert probe_vid(video_path)[2] == FPS, 'when changing fps MAKE SURE no new frames are inserted'
+    images = torch.stack(list(iter_frames(video_path)))
     print ('number of frames in vid:', len(images))
     return images
 
-def calc_mfcc(aud):
-    mfcc = zip(*python_speech_features.mfcc(aud, SR))
-    return np.stack([np.array(i) for i in mfcc])
+def write_vid(video_path, frames, fps=FPS, audio_path=None, shortest=False):
+    frames = iter(frames)
+    first = next(frames)
+    h, w = first.shape[:2]
+    command = ['ffmpeg', '-y', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', '%dx%d' % (w, h),
+               '-r', str(fps), '-i', '-']
+    if audio_path is not None:
+        command += ['-i', audio_path, '-map', '0:v:0', '-map', '1:a:0', '-c:a', 'copy']
+    if shortest:
+        command += ['-shortest']
+    # libx264 at crf 25 is imageio's default; yuv420p needs even frame sizes, avi needs no b-frames
+    command += ['-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', '-c:v', 'libx264', '-crf', '25', '-bf', '0', '-pix_fmt', 'yuv420p',
+                video_path]
+    with subprocess.Popen(command, stdin=subprocess.PIPE) as proc:
+        proc.stdin.write(tensor_bytes(first))
+        for frame in frames:
+            proc.stdin.write(tensor_bytes(frame))
+    if proc.returncode:
+        sys.exit('ffmpeg failed writing %s' % video_path)
+
+def calc_mfcc(aud, numcep=13, nfilt=26, nfft=512, preemph=0.97, ceplifter=22):
+    # port of python_speech_features.mfcc with its defaults (25ms frames, 10ms step, no window)
+    frame_len, frame_step = int(0.025 * SR), int(0.01 * SR)
+    sig = torch.cat([aud[:1], aud[1:] - preemph * aud[:-1]])
+    numframes = 1 + max(0, math.ceil((sig.numel() - frame_len) / frame_step))
+    padlen = (numframes - 1) * frame_step + frame_len
+    frames = F.pad(sig, (0, padlen - sig.numel())).unfold(0, frame_len, frame_step)
+    pspec = torch.fft.rfft(frames, nfft).abs() ** 2 / nfft
+
+    eps = torch.finfo(torch.float64).eps
+    energy = pspec.sum(1)
+    energy = torch.where(energy == 0, eps, energy)
+    feat = pspec @ mel_filterbank(nfilt, nfft).T
+    feat = torch.where(feat == 0, eps, feat)
+
+    feat = feat.log() @ dct_matrix(nfilt)[:numcep].T
+    feat = feat * (1 + ceplifter / 2 * torch.sin(math.pi * torch.arange(numcep, dtype=torch.float64) / ceplifter))
+    feat[:, 0] = energy.log()
+    return feat.T
+
+def mel_filterbank(nfilt, nfft):
+    # computed in python floats to reproduce numpy.linspace and the floored fft bins exactly
+    lowmel, highmel = 0.0, 2595 * math.log10(1 + SR / 2 / 700.)
+    step = (highmel - lowmel) / (nfilt + 1)
+    melpoints = [i * step + lowmel for i in range(nfilt + 1)] + [highmel]
+    bins = [math.floor((nfft + 1) * (700 * (10 ** (mel / 2595.0) - 1)) / SR) for mel in melpoints]
+    fbank = torch.zeros(nfilt, nfft // 2 + 1, dtype=torch.float64)
+    for j in range(nfilt):
+        for i in range(bins[j], bins[j + 1]):
+            fbank[j, i] = (i - bins[j]) / (bins[j + 1] - bins[j])
+        for i in range(bins[j + 1], bins[j + 2]):
+            fbank[j, i] = (bins[j + 2] - i) / (bins[j + 2] - bins[j + 1])
+    return fbank
+
+def dct_matrix(n):
+    # orthonormal DCT-II, rows are basis vectors
+    k = torch.arange(n, dtype=torch.float64)
+    mat = torch.cos(math.pi * k[:, None] * (2 * k[None] + 1) / (2 * n)) * math.sqrt(2 / n)
+    mat[0] /= math.sqrt(2)
+    return mat
+
+def interp(x, xp, fp):
+    """numpy.interp along dim 0 of fp (xp increasing); x outside xp takes the edge values."""
+    x = x.clamp(xp[0], xp[-1])
+    i = torch.searchsorted(xp, x, right=True).clamp(1, len(xp) - 1)
+    w = ((x - xp[i - 1]) / (xp[i] - xp[i - 1])).to(fp.dtype)
+    return torch.lerp(fp[i - 1], fp[i], w.view(-1, *[1] * (fp.dim() - 1)))
+
+def medfilt(x, kernel_size):
+    # scipy.signal.medfilt: zero padded running median
+    r = kernel_size // 2
+    return F.pad(x, (r, r)).unfold(0, kernel_size, 1).median(-1).values
+
+def gaussian_filter(x, sigma, truncate=4.0):
+    # 1d scipy.ndimage.gaussian_filter with mode='reflect' (half-sample symmetric)
+    radius = int(truncate * sigma + 0.5)
+    k = torch.arange(-radius, radius + 1, dtype=torch.float64)
+    weights = torch.exp(-0.5 / sigma ** 2 * k ** 2)
+    weights /= weights.sum()
+    n = x.numel()
+    idx = torch.arange(-radius, n + radius) % (2 * n)
+    idx = torch.where(idx < n, idx, 2 * n - 1 - idx)
+    return x[idx].unfold(0, 2 * radius + 1, 1) @ weights
 
 def stabilizeSequence(samples, regularization_lambda=30.0):
-    length = samples.size
+    length = samples.numel()
     if length < 6:
         return samples
-    
+
     # find x that solves laplacian_matrix * x = b
     laplacian_matrix = (
-        np.diag((1.0 + 2 * regularization_lambda) * np.ones((length - 2,)), 0)
-        + np.diag((-1.0 * regularization_lambda) * np.ones((length - 3,)), 1)
-        + np.diag((-1.0 * regularization_lambda) * np.ones((length - 3,)), -1))
-    
-    constraints = np.zeros(length - 2)
+        torch.diag(torch.full((length - 2,), 1.0 + 2 * regularization_lambda, dtype=torch.float64), 0)
+        + torch.diag(torch.full((length - 3,), -1.0 * regularization_lambda, dtype=torch.float64), 1)
+        + torch.diag(torch.full((length - 3,), -1.0 * regularization_lambda, dtype=torch.float64), -1))
+
+    constraints = torch.zeros(length - 2, dtype=torch.float64)
     constraints[0] = (regularization_lambda * samples[0])
     constraints[-1] = (regularization_lambda * samples[-1])
     constraints += samples[1:-1]
 
-    x = samples.copy()
-    x[1:-1] = np.linalg.solve(laplacian_matrix, constraints)
+    x = samples.clone()
+    x[1:-1] = torch.linalg.solve(laplacian_matrix, constraints)
     return x
 
-def im2tensor(im):
-    im = np.expand_dims(np.stack(im,axis=3), axis=0).transpose((0,3,4,1,2))
-    return torch.autograd.Variable(torch.from_numpy(im.astype(float)).float())
-
 def aud2tensor(aud):
-    mfcc = calc_mfcc(aud)
-    cc = np.expand_dims(np.expand_dims(mfcc,axis=0),axis=0)
-    return torch.autograd.Variable(torch.from_numpy(cc.astype(float)).float())
+    return calc_mfcc(aud).float()[None, None]
 
-def run_batch_vid(model, im, ii, lastframe):
-    im_batch = [ im[:,:,vframe:vframe+5,:,:] for vframe in range(ii,min(lastframe,ii+batch_size)) ]
-    im_in = torch.cat(im_batch,0)
-    if cuda:
-        im_in = im_in.cuda()
-    im_out  = model.__S__.forward_lip(im_in)
-    return im_out.data.cpu()
-    
-def run_aud_batch(model, cc, ii, lastframe, every_frame):
-    if every_frame:
-        cc_batch = [cc[:, :, :, vframe:vframe + 20] for vframe in range(ii, min(lastframe, ii+batch_size))]
-    else:
-        cc_batch = [cc[:, :, :, vframe*4:vframe*4 + 20] for vframe in range(ii, min(lastframe, ii+batch_size))]
-    cc_in = torch.cat(cc_batch,0)
-    if cuda:
-        cc_in = cc_in.cuda()
-    cc_out  = model.__S__.forward_aud(cc_in)
-    return cc_out.data.cpu()
-    
 def aud2emb(aud, model, every_frame=False):
     if type(aud) == str:
         aud = read_aud(aud)
-    lastframe = np.round(aud.size/SR*FPS).astype(np.int) - 6
+    lastframe = round(aud.numel()/SR*FPS) - 6
+    step = 1 if every_frame else 4
     if every_frame:
         lastframe *= 4
-    y_tensor = aud2tensor(aud)
-    cc_feat = torch.cat(
-        [run_aud_batch(model, y_tensor, i, lastframe, every_frame=every_frame)
-        for i in range(0, lastframe, batch_size)], 0)
-    return aud, cc_feat.numpy()
+    cc = aud2tensor(aud)
+    dev = next(model.__S__.parameters()).device
+    cc_feat = []
+    with torch.inference_mode():
+        for i in range(0, lastframe, batch_size):
+            cc_in = torch.cat([cc[..., vframe*step:vframe*step + 20] for vframe in range(i, min(lastframe, i+batch_size))])
+            cc_feat.append(model.__S__.forward_aud(cc_in.to(dev)).cpu())
+    return aud, torch.cat(cc_feat)
 
 def vid2emb(images, model, every_frame=False):
     if type(images) == str:
         images = read_vid(images)
-    assert np.all(np.array([224,224,3]) == images[0].shape)
+    assert images.shape[1:] == (224, 224, 3)
     lastframe = len(images) - 6
-    images_tensor = im2tensor(images)
-
-    im_feat = np.concatenate(
-        [run_batch_vid(model, images_tensor, i, lastframe)
-        for i in range(0,lastframe,batch_size)])
+    im = images.permute(3, 0, 1, 2)[None].float()  # 1 x 3 x T x H x W
+    dev = next(model.__S__.parameters()).device
+    im_feat = []
+    with torch.inference_mode():
+        for i in range(0, lastframe, batch_size):
+            im_in = torch.cat([im[:, :, vframe:vframe+5] for vframe in range(i, min(lastframe, i+batch_size))])
+            im_feat.append(model.__S__.forward_lip(im_in.to(dev)).cpu())
+    im_feat = torch.cat(im_feat)
 
     if every_frame:
-        coordinates = np.meshgrid(np.arange(im_feat.shape[0]*4), np.arange(im_feat.shape[1]))
-        coordinates = np.stack(coordinates).astype(np.float32).transpose((0,2,1))
-        coordinates[0] /= 4
-        im_feat = map_coordinates(im_feat, coordinates, order=1)
+        frames = torch.arange(len(im_feat), dtype=torch.float64)
+        im_feat = interp(torch.arange(len(im_feat) * 4, dtype=torch.float64) / 4, frames, im_feat)
 
     return images, im_feat
 
 def run_command(command, verbose=True):
-    print('runing: ', command if verbose else '...' , end=' ')
-    ret =  subprocess.call(command, shell=True, stdout=FNULL, stderr=FNULL)
+    print('runing: ', shlex.join(command) if verbose else '...' , end=' ')
+    ret = subprocess.call(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if ret :
         print('\nFailed!!!')
-        sys.exit()
+        sys.exit(1)
     else:
         print('.... OK!')
 
+def _window():
+    return torch.hann_window(WINDOW_SIZE, dtype=torch.float64)
+
 def aud2spec(aud):
-    return signal.stft(aud, nperseg=WINDOW_SIZE, noverlap=OVERLAP)[2]
+    # scipy.signal.stft framing (zero boundary, padded to whole frames), without its 1/sum(window) scale
+    aud = F.pad(aud, (0, -aud.numel() % HOP))
+    return torch.stft(aud, WINDOW_SIZE, HOP, window=_window(), center=True, pad_mode='constant', return_complex=True)
 
 def spec2aud(spec):
-    return signal.istft(spec, nperseg=WINDOW_SIZE, noverlap=OVERLAP)[1]
-
-
-def warp_spec(spec, warp):
-    xx, yy = np.meshgrid(np.arange(warp.size), np.arange(spec.shape[0]))
-    coordiantes = [yy, warp+xx]
-    warped_real = map_coordinates(spec.real, coordiantes, mode='reflect', order=1)
-    warped_imag = map_coordinates(spec.imag, coordiantes, mode='reflect', order=1)
-    return warped_real + 1j*warped_imag
-
-def data_dist(d1,d2):
-    return np.mean((d1-d2)**2)
-
-def cos(d1,d2):
-    d1 = d1 / np.linalg.norm(d1)
-    d2 = d2 / np.linalg.norm(d2)
-    return (d1 @ d2)
+    return torch.istft(spec, WINDOW_SIZE, HOP, window=_window(), center=True)
 
 def resize_vec(vec, new_length):
     new_length = int(new_length)
-    vec = vec * new_length / vec.size
-    coordinates = np.linspace(0, vec.size-1, new_length)
-    return map_coordinates(vec, [coordinates], order=1)
+    vec = vec * new_length / vec.numel()
+    coordinates = torch.linspace(0, vec.numel()-1, new_length, dtype=torch.float64)
+    return interp(coordinates, torch.arange(vec.numel(), dtype=torch.float64), vec)
 
-def minimal_dist(features1, features2, i, j):
-    dists = []
-    for f1 in features1:
-        for f2 in features2:
-            dists.append(data_dist(f1[i], f2[j]))
-    return np.min(dists)
-
-def prev(ind):
-    return max(0, ind-1)
+def data_cost(emb1, emb2, prefer_delay=False):
+    # minimal mean squared distance over all pairs of feature streams
+    cost = torch.stack([
+        torch.cdist(f1.double(), f2.double(), compute_mode='donot_use_mm_for_euclid_dist') ** 2 / f1.shape[1]
+        for f1 in emb1 for f2 in emb2]).amin(0)
+    if prefer_delay:
+        cost = torch.minimum(cost, torch.cat([cost[:1], cost[:-1]]))
+    return cost
 
 def dynamic_programming(emb1, emb2, max_warp=MAX_WARP, prefer_delay=False):
     if not type(emb1) == list:
         emb1 = [emb1]
         emb2 = [emb2]
-    mat = np.ones((emb1[0].shape[0], emb2[0].shape[0])) * np.inf
+    n, m = emb1[0].shape[0], emb2[0].shape[0]
+    cost = data_cost(emb1, emb2, prefer_delay).tolist()
+    smooth_cost = 1 / smooth_div
 
-    mat[0,:relax_end] = 0
-    mat[:relax_end,0] = 0
+    # plain python floats: fast enough for the banded loop and keeps np.argmin's tie breaking
+    mat = [[math.inf] * m for _ in range(n)]
+    mat[0][:relax_end] = [0.0] * min(relax_end, m)
+    for i in range(min(relax_end, n)):
+        mat[i][0] = 0.0
 
-    orig = np.zeros((emb1[0].shape[0], emb2[0].shape[0], 2), dtype=int)
+    orig = [[(0, 0)] * m for _ in range(n)]
 
-    for i in range(emb1[0].shape[0]):
-        diag_i = i*mat.shape[1]//mat.shape[0]
-        for j in range(max(0, diag_i-max_warp), min(diag_i+max_warp, mat.shape[1])):
-            if prefer_delay:
-                data_cost = np.minimum(minimal_dist(emb1, emb2, i, j),
-                                       minimal_dist(emb1, emb2, prev(i), j))
+    for i in range(n):
+        pi = max(0, i-1)
+        diag_i = i*m//n
+        row, prev_row, cost_row = mat[i], mat[pi], cost[i]
+        for j in range(max(0, diag_i-max_warp), min(diag_i+max_warp, m)):
+            pj = max(0, j-1)
+            c = cost_row[j]
+            left, diag, up = c + smooth_cost + row[pj], c + prev_row[pj], c + smooth_cost + prev_row[j]
+            if left <= diag and left <= up:
+                row[j], orig[i][j] = left, (i, pj)
+            elif diag <= up:
+                row[j], orig[i][j] = diag, (pi, pj)
             else:
-                data_cost = minimal_dist(emb1, emb2, i, j)
-            smooth_costs = np.array([1,0,1])/smooth_div
-            prev_costs = [mat[i, prev(j)], mat[prev(i),prev(j)], mat[prev(i), j]]
-
-            cost = data_cost + smooth_costs + prev_costs
-
-            argmin = np.argmin(cost)
-            orig[i,j] = [[i, prev(j)], [prev(i),prev(j)], [prev(i), j]][argmin]
-            mat[i,j] = cost[argmin]
-    return mat, orig
+                row[j], orig[i][j] = up, (pi, j)
+    return torch.tensor(mat, dtype=torch.float64), orig
 
 def done(i,j):
     if i == 0 and j < relax_end:
@@ -218,57 +284,47 @@ def done(i,j):
     return False
 
 def find_path(dp_mat, dp_orig):
-    amin1 = np.argmin(dp_mat[-1, -relax_end:]) + dp_mat.shape[1]-relax_end
-    amin2 = np.argmin(dp_mat[-relax_end:, -1]) + dp_mat.shape[0]-relax_end
+    n, m = dp_mat.shape
+    amin1 = dp_mat[-1, -relax_end:].argmin().item() + m-relax_end
+    amin2 = dp_mat[-relax_end:, -1].argmin().item() + n-relax_end
     path = []
     if dp_mat[-1, amin1] < dp_mat[amin2, -1]:
-        i,j = dp_orig.shape[0]-1, amin1
+        i,j = n-1, amin1
     else:
-        i,j = amin2, dp_orig.shape[1]-1
-    cost = dp_mat[i,j]
+        i,j = amin2, m-1
+    cost = dp_mat[i,j].item()
     while not done(i,j):
         path.append([i,j])
-        i,j = dp_orig[i,j]
+        i,j = dp_orig[i][j]
     path.append([i,j])
     path = path[::-1]
-    return np.array(path), cost
+    return torch.tensor(path), cost
 
 def griffin_lim(spec, iterations=100):
-    mag = np.abs(spec)
+    mag = spec.abs()
     iterations = max(iterations, 1)
     for i in range(iterations):
-        wav = signal.istft(spec, nperseg=WINDOW_SIZE, noverlap=OVERLAP)[1]
-        phase = np.angle(signal.stft(wav, nperseg=WINDOW_SIZE, noverlap=OVERLAP)[2])
-        spec = mag * np.exp(1j* phase)
+        wav = spec2aud(spec)
+        spec = torch.polar(mag, aud2spec(wav).angle())
     return wav
 
 def phase_vocoder(spec, time_steps):
-    hop_length=WINDOW_SIZE-OVERLAP
-
-    xx, yy = np.meshgrid(np.arange(time_steps.size), np.arange(spec.shape[0]))
-    xx = np.zeros_like(xx) 
-    coordiantes = [yy, time_steps+xx]
-    warped_spec = map_coordinates(np.abs(spec), coordiantes, mode='reflect', order=1).astype(np.complex)
+    # magnitude: linear interpolation in time, clamped at the edges
+    frames = torch.arange(spec.shape[1], dtype=torch.float64)
+    warped_mag = interp(time_steps, frames, spec.abs().T).T
 
     # Expected phase advance in each bin
-    phi_advance = np.linspace(0, np.pi * hop_length, spec.shape[0])
+    phi_advance = torch.linspace(0, math.pi * HOP, spec.shape[0], dtype=torch.float64)[:, None]
 
-    # Phase accumulator; initialize to the first sample
-    spec_angle = np.pad(np.angle(spec), [(0, 0), (0, 1)], mode='constant')
-    phase_acc = spec_angle[:, 0]
+    spec_angle = F.pad(spec.angle(), (0, 1))
+    steps = time_steps.floor().long()
 
-    for (t, step) in enumerate(np.floor(time_steps).astype(np.int)):
+    # Phase advance between the source frames, wrapped to -pi:pi range
+    dphase = spec_angle[:, steps+1] - spec_angle[:, steps] - phi_advance
+    dphase = torch.remainder(dphase-math.pi, 2*math.pi) - math.pi
 
-        # Store to output array
-        warped_spec[:, t] *= np.exp(1.j * phase_acc)
+    # Accumulate phase, starting from the phase of the first frame
+    phase_acc = torch.cumsum(phi_advance + dphase, 1)
+    phase_acc = spec_angle[:, :1] + torch.cat([torch.zeros_like(phase_acc[:, :1]), phase_acc[:, :-1]], 1)
 
-        # Compute phase advance
-        dphase = (spec_angle[:, step+1] - spec_angle[:, step] - phi_advance)
-
-        # Wrap to -pi:pi range
-        dphase = np.mod(dphase-np.pi, 2*np.pi)-np.pi
-
-        # Accumulate phase
-        phase_acc += phi_advance + dphase
-
-    return warped_spec
+    return torch.polar(warped_mag, phase_acc)

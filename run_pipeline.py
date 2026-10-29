@@ -1,13 +1,11 @@
 #!/usr/bin/python
 
-import time, os, pdb, argparse, subprocess
-import numpy as np
-import tensorflow as tf
-from skimage.transform import resize
-import imageio
+import time, os, argparse, itertools
+import torch
+import torch.nn.functional as F
 
-from scipy.interpolate import interp1d
-from scipy import signal
+import avsnap_utils as utils
+from s3fd import S3FD
 
 # ========== ========== ========== ==========
 # # PARSE ARGS
@@ -18,6 +16,8 @@ parser.add_argument('--data_dir', type=str, default='data/', help='Output direco
 parser.add_argument('videofile', type=str, default='', help='Input video file');
 parser.add_argument('--crop_scale', type=float, default=0.5, help='Scale bounding box');
 parser.add_argument('--min_track', type=int, default=30, help='Minimum facetrack duration');
+parser.add_argument('--facedet_scale', type=float, default=0.25, help='Scale input image for face detection');
+parser.add_argument('--min_conf', type=float, default=0.9, help='Minimum face detection confidence');
 opt = parser.parse_args();
 
 base_name = os.path.splitext(os.path.basename(opt.videofile))[0]
@@ -28,19 +28,19 @@ setattr(opt,'out_dir', os.path.join(opt.data_dir, 'out', base_name))
 # ========== ========== ========== ==========
 
 def bb_intersection_over_union(boxA, boxB):
-  
+
   xA = max(boxA[0], boxB[0])
   yA = max(boxA[1], boxB[1])
   xB = min(boxA[2], boxB[2])
   yB = min(boxA[3], boxB[3])
- 
+
   interArea = max(0, xB - xA) * max(0, yB - yA)
- 
+
   boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
   boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
- 
+
   iou = interArea / float(boxAArea + boxBArea - interArea)
- 
+
   return iou
 
 # ========== ========== ========== ==========
@@ -73,98 +73,74 @@ def track_shot(opt, scenefaces):
     if track == []:
       break
     elif len(track) > opt.min_track:
-      
-      framenum    = np.array([ f[0] for f in track ])
-      bboxes    = np.array([np.array(f[1]) for f in track])
 
-      frame_i   = np.arange(framenum[0],framenum[-1]+1)
+      framenum    = torch.tensor([ f[0] for f in track ], dtype=torch.float64)
+      bboxes    = torch.tensor([ f[1] for f in track ], dtype=torch.float64)
 
-      bboxes_i    = []
-      for ij in range(0,4):
-        interpfn  = interp1d(framenum, bboxes[:,ij])
-        bboxes_i.append(interpfn(frame_i))
-      bboxes_i  = np.stack(bboxes_i, axis=1)
+      frame_i   = torch.arange(track[0][0], track[-1][0]+1)
 
-      if np.mean(bboxes_i[:,3]-bboxes_i[:,1]) > minSize:
+      bboxes_i  = utils.interp(frame_i.double(), framenum, bboxes)
+
+      if torch.mean(bboxes_i[:,3]-bboxes_i[:,1]) > minSize:
         tracks.append([frame_i,bboxes_i])
   return tracks
 
 # ========== ========== ========== ==========
 # # VIDEO CROP AND SAVE
 # ========== ========== ========== ==========
-        
+
 def crop_video(opt,track):
 
-  reader = imageio.get_reader(os.path.join(opt.out_dir, 'video.avi'))
-
-  fps = reader.get_meta_data()['fps']
-  cropped_file = os.path.join(opt.out_dir, 'cropped')
-  vOut = imageio.get_writer(cropped_file + 't.avi', fps=fps)
-
-  fw, fh = reader.get_meta_data()['size']
+  video_file = os.path.join(opt.out_dir, 'video.avi')
+  fw, fh, fps = utils.probe_vid(video_file)
+  cropped_file = os.path.join(opt.out_dir, 'cropped.avi')
 
   dets = [[], [], []]
 
-  for det in track[1]:
+  for det in track[1].tolist():
 
     dets[0].append(((det[3]-det[1])*fw+(det[2]-det[0])*fh)/4) # H+W / 4
-    dets[1].append((det[1]+det[3])*fw/2) # crop center x 
+    dets[1].append((det[1]+det[3])*fw/2) # crop center x
     dets[2].append((det[0]+det[2])*fh/2) # crop center y
 
   # Smooth detections
-  dets[0] = signal.medfilt(dets[0],kernel_size=5)   
-  dets[1] = signal.medfilt(dets[1],kernel_size=5)
-  dets[2] = signal.medfilt(dets[2],kernel_size=7)
+  dets[0] = utils.medfilt(torch.tensor(dets[0], dtype=torch.float64),kernel_size=5).tolist()
+  dets[1] = utils.medfilt(torch.tensor(dets[1], dtype=torch.float64),kernel_size=5).tolist()
+  dets[2] = utils.medfilt(torch.tensor(dets[2], dtype=torch.float64),kernel_size=7).tolist()
 
-  for det in zip(*dets):
+  def crop_frames():
+    frames = itertools.islice(utils.iter_frames(video_file), track[0][0].item(), None)
+    for det, frame in zip(zip(*dets), frames):
 
-    cs  = opt.crop_scale
+      cs  = opt.crop_scale
 
-    bs  = det[0]            # Detection box size
-    bsi = int(bs*(1+2*cs))  # Pad videos by this amount 
+      bs  = det[0]            # Detection box size
+      bsi = int(bs*(1+2*cs))  # Pad videos by this amount
 
-    try:
-        frame = reader.get_next_data()
-    except:
-        break
+      frame = F.pad(frame.permute(2,0,1), (bsi,bsi,bsi,bsi))
+      my  = det[2]+bsi  # BBox center Y
+      mx  = det[1]+bsi  # BBox center X
 
-    frame = np.pad(frame,((bsi,bsi),(bsi,bsi),(0,0)), 'constant', constant_values=(0,0))
-    my  = det[2]+bsi  # BBox center Y
-    mx  = det[1]+bsi  # BBox center X
+      face = frame[:,int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
 
-    face = frame[int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
-
-    resized = resize(face,(224,224), mode='reflect', anti_aliasing=True)
-    vOut.append_data((255*resized).round().clip(0,255).astype(np.uint8))
-
-  audiotmp  = os.path.join(opt.out_dir, 'audio.wav')
-  audiostart  = track[0][0]/fps
-  audioend  = (track[0][-1]+1)/fps
-
-  vOut.close()
+      resized = F.interpolate(face[None].float(), size=(224,224), mode='bilinear', antialias=True)[0]
+      yield resized.round().clamp(0,255).to(torch.uint8).permute(1,2,0)
 
   # ========== CROP AUDIO FILE ==========
 
-  command = ("ffmpeg -y -i %s -ac 1 -vn -acodec pcm_s16le -ar 16000 -ss %.3f -to %.3f %s" %
-             (os.path.join(opt.out_dir, 'video.avi'),audiostart,audioend,audiotmp)) #-async 1
-  output = subprocess.call(command, shell=True, stdout=None)
+  audiotmp  = os.path.join(opt.out_dir, 'audio.wav')
+  audiostart  = track[0][0].item()/fps
+  audioend  = (track[0][-1].item()+1)/fps
 
-  if output != 0:
-    pdb.set_trace()
+  command = ['ffmpeg', '-y', '-i', video_file, '-ac', '1', '-vn', '-acodec', 'pcm_s16le', '-ar', str(utils.SR),
+             '-ss', '%.3f' % audiostart, '-to', '%.3f' % audioend, audiotmp]
+  utils.run_command(command)
 
-  # sample_rate, audio = wavfile.read(audiotmp)
+  # ========== WRITE CROPPED VIDEO WITH AUDIO ==========
 
-  # ========== COMBINE AUDIO AND VIDEO FILES ==========
-
-  command = ("ffmpeg -y -i %st.avi -i %s -c:v copy -c:a copy %s.avi" % (cropped_file ,audiotmp, cropped_file)) #-async 1
-  output = subprocess.call(command, shell=True, stdout=None)
-
-  if output != 0:
-    pdb.set_trace()
+  utils.write_vid(cropped_file, crop_frames(), fps, audio_path=audiotmp)
 
   print('Written %s'%cropped_file)
-
-  os.remove(cropped_file+'t.avi')
 
 
 # ========== ========== ========== ==========
@@ -173,62 +149,24 @@ def crop_video(opt,track):
 
 def inference_video(opt):
 
-  # Path to frozen detection graph. This is the actual model that is used for the object detection.
-  PATH_TO_CKPT = './protos/frozen_inference_graph_face.pb'
+  detector = S3FD(os.path.join(utils.data_dir, 'sfd_face.pth'), utils.device)
 
-  MIN_CONF = 0.3
-
-  reader = imageio.get_reader(os.path.join(opt.out_dir, 'video.avi'))
-  print(reader.get_meta_data())
-
-  detection_graph = tf.Graph()
-  with detection_graph.as_default():
-      od_graph_def = tf.GraphDef()
-      with tf.gfile.GFile(PATH_TO_CKPT, 'rb') as fid:
-          serialized_graph = fid.read()
-          od_graph_def.ParseFromString(serialized_graph)
-          tf.import_graph_def(od_graph_def, name='')
+  video_file = os.path.join(opt.out_dir, 'video.avi')
+  print(utils.probe_vid(video_file))
 
   dets = []
 
-  with detection_graph.as_default():
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    with tf.Session(graph=detection_graph, config=config) as sess:
-      frame_num = 0;
-      while True:
-        try:
-            image_np = reader.get_next_data()
-        except:
-            break
+  for frame_num, image_np in enumerate(utils.iter_frames(video_file)):
 
-        image_np_expanded = np.expand_dims(image_np, axis=0)
-        image_tensor = detection_graph.get_tensor_by_name('image_tensor:0')
+    # Actual detection.
+    start_time = time.time()
+    boxes = detector.detect(image_np, conf_th=opt.min_conf, scale=opt.facedet_scale)
+    elapsed_time = time.time() - start_time
 
-        boxes = detection_graph.get_tensor_by_name('detection_boxes:0')
+    dets.append([[frame_num, box[:4], box[4]] for box in boxes.tolist()])
 
-        scores = detection_graph.get_tensor_by_name('detection_scores:0')
-        classes = detection_graph.get_tensor_by_name('detection_classes:0')
-        num_detections = detection_graph.get_tensor_by_name('num_detections:0')
-        
-        # Actual detection.
-        start_time = time.time()
-        (boxes, scores, classes, num_detections) = sess.run(
-            [boxes, scores, classes, num_detections],
-            feed_dict={image_tensor: image_np_expanded})
-        elapsed_time = time.time() - start_time
-        
-        score = scores[0]
-
-        dets.append([]);
-        for index in range(0,len(score)):
-          if score[index] > MIN_CONF:
-            dets[-1].append([frame_num, boxes[0][index].tolist(),score[index]])
-
-        print('%s-%05d; %d dets; %.2f Hz' %
-              (os.path.join(opt.out_dir,'video.avi'),
-               frame_num,len(dets[-1]),(1/elapsed_time)))
-        frame_num += 1
+    print('%s-%05d; %d dets; %.2f Hz' %
+          (video_file, frame_num, len(dets[-1]), (1/elapsed_time)))
 
   return dets
 
@@ -236,12 +174,11 @@ def inference_video(opt):
 # # EXECUTE DEMO
 # ========== ========== ========== ==========
 
-if not os.path.exists(opt.out_dir):
-  os.makedirs(opt.out_dir)
+os.makedirs(opt.out_dir, exist_ok=True)
 
-command = ("ffmpeg -y -i %s -qscale:v 4 -async 1 -r 25 -deinterlace %s" %
-           (opt.videofile, os.path.join(opt.out_dir, 'video.avi')))
-output = subprocess.call(command, shell=True, stdout=None)
+command = ['ffmpeg', '-y', '-i', opt.videofile, '-qscale:v', '4', '-r', str(utils.FPS),
+           '-vf', 'yadif=deint=interlaced', '-af', 'aresample=async=1', os.path.join(opt.out_dir, 'video.avi')]
+utils.run_command(command)
 faces = inference_video(opt)
 
 tracks = track_shot(opt, faces)

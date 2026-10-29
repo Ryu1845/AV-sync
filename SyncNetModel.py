@@ -1,15 +1,6 @@
 import torch
 import torch.nn as nn
 
-def save(model, filename):
-    with open(filename, "wb") as f:
-        torch.save(model, f);
-        print("%s saved."%filename);
-
-def load(filename):
-    net = torch.load(filename)
-    return net;
-    
 class S(nn.Module):
     def __init__(self, num_layers_in_fc_layers = 1024):
         super(S, self).__init__();
