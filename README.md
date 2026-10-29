@@ -7,20 +7,19 @@ The model and code can be used for research purposes under <a href="https://crea
 Please cite the papers below if you make use of the software.
 
 ## Prerequisites
-The following packages are required:
-```
-pytorch (0.4.0)
-numpy (1.14.3)
-scipy (1.0.1)
-python_speech_features (0.6)
-cuda (8.0)
-ffmpeg (3.4.2)
-tensorflow (1.2, 1.4)
-scikit-image (0.14,1)
-imageio (2.2.0)
-```
+- Python >= 3.11
+- PyTorch >= 2.15
+- ffmpeg and ffprobe (with libx264)
 
-The demo has been tested with the package versions shown above, but may also work on other versions.
+Install with [uv](https://docs.astral.sh/uv/)
+```
+uv sync
+```
+or with pip
+```
+pip install torch
+```
+The diagnostic plots written by `align_audio.py --save_dp_images` additionally need matplotlib (`uv sync --extra plot`).
 
 ## Demo
 
@@ -41,7 +40,8 @@ You can use only one of the modalities by changing the flag ```--modality``` to 
 
 Outputs:
 ```
-data/out/video1_video2/modality_all.mp4
+data/out/video1_video2/modality_all.avi
+data/out/video1_video2/mix.avi
 ```
 
 ## Publications

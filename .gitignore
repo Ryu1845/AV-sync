@@ -40,6 +40,4 @@ Thumbs.db
 # Specific to this demo #
 #########################
 data/
-protos/
-utils/__init__.py
 

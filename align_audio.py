@@ -1,13 +1,7 @@
-import os, argparse
-from scipy.io import wavfile
-import numpy as np
-from scipy.ndimage.filters import gaussian_filter
+import os, argparse, itertools
+import torch
 import SyncNetInstance
 import avsnap_utils as utils
-import imageio
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--modality', type=str, default='va', 
@@ -20,7 +14,7 @@ parser.add_argument('--gaussian_sigma', type=int, default=10,
 
 parser.add_argument('--prefer_delay', action='store_true', default=False)
 parser.add_argument('--save_dp_images', action='store_true', default=False,
-                    help='whether to store images showing the dynamic programing weights')
+                    help='whether to store images showing the dynamic programing weights (requires matplotlib)')
 
 parser.add_argument('vid1', type=str)
 parser.add_argument('vid2', type=str)
@@ -38,14 +32,18 @@ max_diff_sync = opt.max_diff_smooth
 gaussian_sigma = opt.gaussian_sigma 
 
 
+def pyplot():
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    return plt
+
+
 def process_data():
     data = {}
 
     data['vid1_base_name'] = os.path.basename(opt.vid1)[:-4]
     data['vid2_base_name'] = os.path.basename(opt.vid2)[:-4]
-
-    data['vid1'] = utils.read_vid(opt.vid1)
-    data['vid2'] = utils.read_vid(opt.vid2)
 
     data['aud1'] = utils.read_aud(os.path.join('data/out', data['vid1_base_name'], 'audio.wav'))
     data['aud2'] = utils.read_aud(os.path.join('data/out', data['vid2_base_name'], 'audio.wav'))
@@ -54,7 +52,7 @@ def process_data():
     vid2_cropped = os.path.join('data/out', data['vid2_base_name'], 'cropped.avi')
     if opt.modality == 'all':
         def get_audio_and_video_embeddings(vid, aud):
-            vid_emb = utils.vid2emb(vid, model, True)[1]
+            vid_emb = utils.vid2emb(vid, model, True)
             aud_emb = utils.aud2emb(aud, model, True)[1]
             min_len = min(len(vid_emb), len(aud_emb))
             return [vid_emb[:min_len], aud_emb[:min_len]]
@@ -64,11 +62,11 @@ def process_data():
 
     else:
         if opt.modality[0] == 'v':
-            data['emb1'] = utils.vid2emb(vid1_cropped, model, True)[1]
+            data['emb1'] = utils.vid2emb(vid1_cropped, model, True)
         else:
             data['emb1'] = utils.aud2emb(data['aud1'], model, True)[1]
         if opt.modality[1] == 'v':
-            data['emb2'] = utils.vid2emb(vid2_cropped, model, True)[1]
+            data['emb2'] = utils.vid2emb(vid2_cropped, model, True)
         else:
             data['emb2'] = utils.aud2emb(data['aud2'], model, True)[1]
 
@@ -78,37 +76,34 @@ def process_data():
 
 
 def write_mix(data, out_folder):
-    audio_mix = np.zeros(max(len(data['aud1']), len(data['aud2'])))
+    audio_mix = torch.zeros(max(len(data['aud1']), len(data['aud2'])), dtype=torch.float64)
     audio_mix[:len(data['aud1'])] += data['aud1']
     audio_mix[:len(data['aud2'])] += data['aud2']
-    wavfile.write('tmp.wav', rate=utils.SR, data=audio_mix/audio_mix.max())
+    utils.write_aud('tmp.wav', audio_mix)
 
-    num_frames = max(len(data['vid1']), len(data['vid2']))
-    frame_size1 = np.array(data['vid1'][0].shape[:2])
-    frame_size2 = np.array(data['vid2'][0].shape[:2])
-    pair_frame_size = (max(frame_size1[0], frame_size2[0]), frame_size1[1]+frame_size2[1], 3)
-    writer = imageio.get_writer('tmp.mp4', fps=25)
-    for i in range(num_frames):
-        pair = np.zeros(pair_frame_size, dtype=np.uint8)
-        if i < len(data['vid1']):
-            pair[:frame_size1[0], :frame_size1[1]] = data['vid1'][i]
-        if i < len(data['vid2']):
-            pair[:frame_size2[0], frame_size1[1]:frame_size1[1]+frame_size2[1]] = data['vid2'][i]
-        writer.append_data(pair)
-    writer.close()
+    for vid in (opt.vid1, opt.vid2):
+        assert utils.probe_vid(vid)[2] == utils.FPS, 'when changing fps MAKE SURE no new frames are inserted'
+    w1, h1, _ = utils.probe_vid(opt.vid1)
+    w2, h2, _ = utils.probe_vid(opt.vid2)
 
-    command = (
-        'ffmpeg -y -i tmp.mp4 -i tmp.wav -c:v copy -c:a copy -map 0:v:0 -map 1:a:0 -shortest %s' %
-        os.path.join(out_folder, 'mix.avi'))
-    utils.run_command(command)
+    def pairs():
+        for frame1, frame2 in itertools.zip_longest(utils.iter_frames(opt.vid1), utils.iter_frames(opt.vid2)):
+            pair = torch.zeros((max(h1, h2), w1 + w2, 3), dtype=torch.uint8)
+            if frame1 is not None:
+                pair[:h1, :w1] = frame1
+            if frame2 is not None:
+                pair[:h2, w1:w1+w2] = frame2
+            yield pair
+
+    utils.write_vid(os.path.join(out_folder, 'mix.avi'), pairs(), audio_path='tmp.wav', shortest=True)
     os.remove('tmp.wav')
-    os.remove('tmp.mp4')
 
 
-def warp_audio(spec, vid, dp_path, base_file):
+def warp_audio(spec, dp_path, base_file):
     if dp_path.max() >= spec.shape[1]:
         print('flow field reaches outside source for warp')
-        spec = np.pad(spec, ((0, 0), (0, int(dp_path.max() - spec.shape[1] + 1))), mode='constant')
+        pad = torch.zeros(spec.shape[0], int(dp_path.max() - spec.shape[1] + 1), dtype=spec.dtype)
+        spec = torch.cat([spec, pad], 1)
     warped_complex_dp = utils.phase_vocoder(spec, dp_path)
 
     print('applying griffin lim')
@@ -117,11 +112,10 @@ def warp_audio(spec, vid, dp_path, base_file):
 
     warped_aud_file = utils.data_dir + 'tmp_dp.wav'
 
-    wavfile.write(warped_aud_file, rate=utils.SR, data=aud_dp_gl / aud_dp_gl.max())
+    utils.write_aud(warped_aud_file, aud_dp_gl)
 
-    command = (
-        'ffmpeg -y -i %s -i %s -c:v copy -c:a copy -map 0:v:0 -map 1:a:0 -shortest %s' %
-        (opt.vid1, warped_aud_file, base_file + '.avi'))
+    command = ['ffmpeg', '-y', '-i', opt.vid1, '-i', warped_aud_file, '-c:v', 'copy', '-c:a', 'copy',
+               '-map', '0:v:0', '-map', '1:a:0', '-shortest', base_file + '.avi']
     utils.run_command(command)
     os.remove(warped_aud_file)
 
@@ -135,42 +129,39 @@ def smooth_flow(path, prefix):
     while max_diff < max_diff_sync and sigma < 10000:
         sigma *= 1.5 
         path_smoothed = utils.stabilizeSequence(path, sigma)
-        max_diff = np.abs(path_smoothed/factor - path/factor).max()
+        max_diff = (path_smoothed/factor - path/factor).abs().max().item()
     print('max smoothness (seconds): ', max_diff)
 
-    path_smoothed = gaussian_filter(path_smoothed, gaussian_sigma)
+    path_smoothed = utils.gaussian_filter(path_smoothed, gaussian_sigma)
 
-    plt.figure()
-    plt.plot(path / factor)
-    plt.plot(path_smoothed / factor)
-    plt.savefig(prefix + '_dp_smooth.png', dpi=150)
-    return path_smoothed + np.arange(path_smoothed.size)
+    if opt.save_dp_images:
+        plt = pyplot()
+        plt.figure()
+        plt.plot(path / factor)
+        plt.plot(path_smoothed / factor)
+        plt.savefig(prefix + '_dp_smooth.png', dpi=150)
+    return path_smoothed + torch.arange(path_smoothed.numel())
 
 
 def save_dp_images(dp_mat, dp_path, data):
     if opt.modality == 'all':
-        dists = [np.linalg.norm(data['emb2'][0][None] - data['emb1'][0][:, None], axis=(2)),
-                 np.linalg.norm(data['emb2'][0][None] - data['emb1'][1][:, None], axis=(2)),
-                 np.linalg.norm(data['emb2'][1][None] - data['emb1'][0][:, None], axis=(2)),
-                 np.linalg.norm(data['emb2'][1][None] - data['emb1'][1][:, None], axis=(2)), ]
-        max_shape = np.maximum(np.maximum(dists[0].shape, dists[1].shape),
-                               np.maximum(dists[2].shape, dists[3].shape))
-        for i in range(4):
-            dists[i] = np.pad(dists[i],
-                              ((0, max_shape[0] - dists[i].shape[0]),
-                               (0, max_shape[1] - dists[i].shape[1])), mode='edge')
-        dists = np.minimum(np.minimum(dists[0], dists[1]), np.minimum(dists[2], dists[3]))
+        dists = [torch.cdist(e1, e2) for e1 in data['emb1'] for e2 in data['emb2']]
+        max_shape = [max(d.shape[k] for d in dists) for k in range(2)]
+        dists = [torch.nn.functional.pad(d[None, None], (0, max_shape[1] - d.shape[1], 0, max_shape[0] - d.shape[0]),
+                                         mode='replicate')[0, 0] for d in dists]
+        dists = torch.stack(dists).amin(0)
     else:
-        dists = np.linalg.norm(data['emb2'][None] - data['emb1'][:, None], axis=(2))
+        dists = torch.cdist(data['emb1'], data['emb2'])
 
-    path2_1 = np.array([dp_path[i, 0] for i in range(1, dp_path.shape[0])
-                        if dp_path[i, 1] > dp_path[i - 1, 1]])
-    path2_1 = np.r_[dp_path[0, 0], path2_1]
+    dp_path = dp_path.tolist()
+    path2_1 = [dp_path[0][0]] + [dp_path[i][0] for i in range(1, len(dp_path))
+                                 if dp_path[i][1] > dp_path[i - 1][1]]
 
-    dists_im = dists[dp_path[0, 0]:dp_path[-1, 0] + 1, dp_path[0, 1]:dp_path[-1, 1] + 1]
+    dists_im = dists[dp_path[0][0]:dp_path[-1][0] + 1, dp_path[0][1]:dp_path[-1][1] + 1]
     dists_im = dists_im / dists_im.max()
-    dists_im = np.dstack([dists_im] * 3)
+    dists_im = torch.stack([dists_im] * 3, -1)
 
+    plt = pyplot()
     plt.figure()
     plt.imshow(dp_mat)
     plt.plot(path2_1, 'r')
@@ -193,31 +184,31 @@ def main():
     data['out_base_file'] = os.path.join(out_folder, 'modality_%s' % opt.modality)
     print('out will be saved to ', data['out_base_file'])
 
-    dp_mat, dp_orig = utils.dynamic_programming(data['emb1'], data['emb2'], prefer_delay=opt.prefer_delay)
-    path, cost = utils.find_path(dp_mat, dp_orig)
+    dp = utils.dynamic_programming(data['emb1'], data['emb2'], prefer_delay=opt.prefer_delay)
+    path, cost = utils.find_path(dp)
 
     if opt.save_dp_images:
-        save_dp_images(dp_mat, path, data)
+        save_dp_images(dp.dense(), path, data)
 
     # every audio frame should be associated with a single video frame
-    dp_path = [path[0,1]]
-    for i in range(1,path.shape[0]):
-        if path[i,0] > path[i-1,0]:
-            dp_path.append(path[i, 1])
-    dp_path = np.array(dp_path) + 2 # embeddings refer to the middle frame
-    dp_path = np.concatenate([[0,1], dp_path])
+    path = path.tolist()
+    dp_path = [path[0][1]]
+    for i in range(1,len(path)):
+        if path[i][0] > path[i-1][0]:
+            dp_path.append(path[i][1])
+    dp_path = [0, 1] + [p + 2 for p in dp_path] # embeddings refer to the middle frame
+    dp_path = torch.tensor(dp_path, dtype=torch.float64)
 
-    new_size = utils.WINDOWS_PER_FRAME/4 * dp_path.size
-    dp_path = utils.resize_vec(dp_path - np.arange(dp_path.size),new_size)
+    new_size = utils.WINDOWS_PER_FRAME/4 * dp_path.numel()
+    dp_path = utils.resize_vec(dp_path - torch.arange(dp_path.numel()),new_size)
     dp_path = smooth_flow(dp_path, data['out_base_file'])
 
     write_mix(data, out_folder)
-    warp_audio(data['spec2'], data['vid1'], dp_path, data['out_base_file'])
+    warp_audio(data['spec2'], dp_path, data['out_base_file'])
 
 
 if __name__ == '__main__':
     main()
-    utils.FNULL.close()
     print('done')
 
 

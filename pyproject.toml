@@ -1,0 +1,10 @@
+[project]
+name = "avsnap"
+version = "0.1.0"
+description = "Dynamic temporal alignment of speech to lips"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.15"]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.10"]
